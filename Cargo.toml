@@ -15,7 +15,6 @@ libc = "0.2"
 indexmap = { version = "2.0", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-smart-default = "0.7.0"
 smithay-client-toolkit = "0.19.2"
 wayland-client = "0.31.1"
 clap = { version = "4.3.0", default-features = false, features = [

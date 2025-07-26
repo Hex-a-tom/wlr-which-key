@@ -1,6 +1,5 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
-use smart_default::SmartDefault;
 
 use crate::color::Color;
 use crate::key::SingleKey;
@@ -11,14 +10,11 @@ use super::{ConfigAnchor, Font};
 #[serde(transparent)]
 pub struct Entries(pub IndexMap<SingleKey, Entry>);
 
-#[derive(Deserialize, SmartDefault)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
-    #[default(Color::from_rgba_hex(0x282828ff))]
     pub background: Color,
-    #[default(Color::from_rgba_hex(0xfbf1c7ff))]
     pub color: Color,
-    #[default(Color::from_rgba_hex(0x8ec07cff))]
     pub border: Color,
 
     pub anchor: ConfigAnchor,
@@ -27,18 +23,35 @@ pub struct Config {
     pub margin_bottom: i32,
     pub margin_left: i32,
 
-    #[default(Font::new("monospace 10"))]
     pub font: Font,
-    #[default(" ➜ ".into())]
     pub separator: String,
-    #[default(4.0)]
     pub border_width: f64,
-    #[default(20.0)]
     pub corner_r: f64,
     // defaults to `corner_r`
     pub padding: Option<f64>,
 
     pub menu: Entries,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            background: Color::from_rgba_hex(0x282828ff),
+            color: Color::from_rgba_hex(0xfbf1c7ff),
+            border: Color::from_rgba_hex(0x8ec07cff),
+            anchor: ConfigAnchor::default(),
+            margin_top: i32::default(),
+            margin_right: i32::default(),
+            margin_bottom: i32::default(),
+            margin_left: i32::default(),
+            font: Font::new("monospace 10"),
+            separator: " ➜ ".into(),
+            border_width: 4.0,
+            corner_r: 20.0,
+            padding: Option::default(),
+            menu: Entries::default(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
