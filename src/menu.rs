@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{Error, Result, bail};
 use pangocairo::{cairo, pango};
-use wayrs_utils::keyboard::xkb;
+use smithay_client_toolkit::seat::keyboard::Keysym;
 
 use crate::DEBUG_LAYOUT;
 use crate::color::Color;
@@ -223,7 +223,7 @@ impl Menu {
         Ok(())
     }
 
-    pub fn get_action(&self, modifiers: ModifierState, sym: xkb::Keysym) -> Option<Action> {
+    pub fn get_action(&self, modifiers: ModifierState, sym: Keysym) -> Option<Action> {
         let page = &self.pages[self.cur_page];
 
         let action = page.columns.iter().find_map(|col| {
@@ -236,13 +236,13 @@ impl Menu {
         }
 
         match sym {
-            xkb::Keysym::Escape => {
+            Keysym::Escape => {
                 return Some(Action::Quit);
             }
-            xkb::Keysym::bracketleft | xkb::Keysym::g if modifiers.mod_ctrl => {
+            Keysym::bracketleft | Keysym::g if modifiers.mod_ctrl => {
                 return Some(Action::Quit);
             }
-            xkb::Keysym::BackSpace => {
+            Keysym::BackSpace => {
                 if let Some(parent) = page.parent {
                     return Some(Action::Submenu(parent));
                 }

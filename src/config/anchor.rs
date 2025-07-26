@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use wayrs_protocols::wlr_layer_shell_unstable_v1::zwlr_layer_surface_v1::Anchor;
+use smithay_client_toolkit::shell::wlr_layer::Anchor;
 
 /// Light wrapper around `Anchor` which also supports the "no anchor" value.
 ///
@@ -24,14 +24,14 @@ impl From<ConfigAnchor> for Anchor {
     fn from(value: ConfigAnchor) -> Self {
         match value {
             ConfigAnchor::Center => Anchor::empty(),
-            ConfigAnchor::Top => Anchor::Top,
-            ConfigAnchor::Bottom => Anchor::Bottom,
-            ConfigAnchor::Left => Anchor::Left,
-            ConfigAnchor::Right => Anchor::Right,
-            ConfigAnchor::TopLeft => Anchor::Top | Anchor::Left,
-            ConfigAnchor::TopRight => Anchor::Top | Anchor::Right,
-            ConfigAnchor::BottomLeft => Anchor::Bottom | Anchor::Left,
-            ConfigAnchor::BottomRight => Anchor::Bottom | Anchor::Right,
+            ConfigAnchor::Top => Anchor::TOP,
+            ConfigAnchor::Bottom => Anchor::BOTTOM,
+            ConfigAnchor::Left => Anchor::LEFT,
+            ConfigAnchor::Right => Anchor::RIGHT,
+            ConfigAnchor::TopLeft => Anchor::TOP | Anchor::LEFT,
+            ConfigAnchor::TopRight => Anchor::TOP | Anchor::RIGHT,
+            ConfigAnchor::BottomLeft => Anchor::BOTTOM | Anchor::LEFT,
+            ConfigAnchor::BottomRight => Anchor::BOTTOM | Anchor::RIGHT,
         }
     }
 }

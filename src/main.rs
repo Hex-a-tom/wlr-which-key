@@ -4,30 +4,32 @@ mod key;
 mod menu;
 mod text;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use std::time::Duration;
 
 use anyhow::bail;
 use clap::Parser;
 use pangocairo::cairo;
-
-use wayrs_client::object::ObjectId;
-use wayrs_client::protocol::*;
-use wayrs_client::proxy::Proxy;
-use wayrs_client::{Connection, IoMode};
-use wayrs_client::{EventCtx, global::*};
-use wayrs_protocols::keyboard_shortcuts_inhibit_unstable_v1::*;
-use wayrs_protocols::wlr_layer_shell_unstable_v1::*;
-use wayrs_utils::keyboard::{Keyboard, KeyboardEvent, KeyboardHandler, xkb};
-use wayrs_utils::seats::{SeatHandler, Seats};
-use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
-use wayrs_utils::timer::Timer;
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
+use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1;
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::{delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry, delegate_seat, delegate_shm};
+use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::seat::{keyboard::KeyboardHandler, Capability, SeatHandler, SeatState};
+use smithay_client_toolkit::shell::wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface};
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shm::slot::SlotPool;
+use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::wl_keyboard::WlKeyboard;
+use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_shm::Format;
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
 use crate::key::ModifierState;
 
@@ -60,187 +62,144 @@ fn main() -> anyhow::Result<()> {
     let config = config::Config::new(args.config.as_deref().unwrap_or("config"))?;
     let mut menu = menu::Menu::new(&config)?;
 
-    if let Some(initial_keys) = &args.initial_keys
-        && let Some(initial_action) = menu.navigate_to_key_sequence(initial_keys)?
-    {
-        match initial_action {
-            menu::Action::Submenu(_) => unreachable!(),
-            menu::Action::Quit => return Ok(()),
-            menu::Action::Exec { cmd, keep_open } => {
-                if keep_open {
-                    bail!("Initial key sequence cannot trigger an action with keep_open=true");
+    if let Some(initial_keys) = &args.initial_keys {
+        if let Some(initial_action) = menu.navigate_to_key_sequence(initial_keys)? {
+            match initial_action {
+                menu::Action::Submenu(_) => unreachable!(),
+                menu::Action::Quit => return Ok(()),
+                menu::Action::Exec { cmd, keep_open } => {
+                    if keep_open {
+                        bail!("Initial key sequence cannot trigger an action with keep_open=true");
+                    }
+                    exec(&cmd);
+                    return Ok(());
                 }
-                exec(&cmd);
-                return Ok(());
             }
         }
     }
 
-    let mut conn = Connection::connect()?;
-    conn.blocking_roundtrip()?;
-    conn.add_registry_cb(wl_registry_cb);
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
 
-    let wl_compositor: WlCompositor = conn.bind_singleton(4..=6)?;
-    let wlr_layer_shell: ZwlrLayerShellV1 = conn.bind_singleton(2)?;
+    let registry_state = RegistryState::new(&globals);
+    let output = OutputState::new(&globals, &qh);
+
+    let wl_compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
+
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell not available");
+
+    let seat = SeatState::new(&globals, &qh);
+
     let keyboard_shortcuts_inhibit_manager = match config.inhibit_compositor_keyboard_shortcuts {
-        true => Some(conn.bind_singleton(1)?),
+        true => Some(
+            globals
+                .bind(&qh, 1..=1, ())
+                .expect("zwp_keyboard_shortcuts_inhibit_manager not available"),
+        ),
         false => None,
     };
 
-    let seats = Seats::new(&mut conn);
-    let shm_alloc = ShmAlloc::bind(&mut conn)?;
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
 
     let width = menu.width(&config) as u32;
     let height = menu.height(&config) as u32;
 
-    let wl_surface = wl_compositor.create_surface_with_cb(&mut conn, wl_surface_cb);
+    let surface = wl_compositor.create_surface(&qh);
 
-    let layer_surface = wlr_layer_shell.get_layer_surface_with_cb(
-        &mut conn,
-        wl_surface,
-        None,
-        zwlr_layer_shell_v1::Layer::Overlay,
-        c"wlr_which_key".to_owned(),
-        layer_surface_cb,
-    );
-    layer_surface.set_anchor(&mut conn, config.anchor.into());
-    layer_surface.set_size(&mut conn, width, height);
+    let layer_surface =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("wlr_which_key"), None);
+    layer_surface.set_anchor(config.anchor.into());
+    layer_surface.set_size(width, height);
     layer_surface.set_margin(
-        &mut conn,
         config.margin_top,
         config.margin_right,
         config.margin_bottom,
         config.margin_left,
     );
-    layer_surface.set_keyboard_interactivity(
-        &mut conn,
-        zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
-    );
-    wl_surface.commit(&mut conn);
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+
+    layer_surface.commit();
 
     let mut state = State {
-        shm_alloc,
-        seats,
-        keyboards: Vec::new(),
-        kbd_repeat: None,
-        outputs: Vec::new(),
+        pool: SlotPool::new((width * height * 4) as usize, &shm).unwrap(),
         keyboard_shortcuts_inhibit_manager,
         keyboard_shortcuts_inhibitors: HashMap::new(),
 
-        wl_surface,
+        shm,
+        output,
+        registry_state,
         layer_surface,
-        visible_on_outputs: HashSet::new(),
+        seat,
+        keyboard: None,
+
         surface_scale: 1,
         exit: false,
         configured: false,
         width,
         height,
-        throttle_cb: None,
-        throttled: false,
+        damaged: true,
 
         menu,
         config,
+
+        modifiers: ModifierState::default(),
     };
 
     while !state.exit {
-        conn.flush(IoMode::Blocking)?;
-
-        poll(
-            conn.as_raw_fd(),
-            state.kbd_repeat.as_ref().map(|x| x.0.sleep()),
-        )?;
-
-        if let Some((timer, action)) = &mut state.kbd_repeat
-            && timer.tick()
-        {
-            let action = action.clone();
-            state.handle_action(&mut conn, action);
-        }
-
-        match conn.recv_events(IoMode::NonBlocking) {
-            Ok(()) => conn.dispatch_events(&mut state),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-            Err(e) => return Err(e.into()),
-        }
+        event_queue.blocking_dispatch(&mut state).unwrap();
     }
 
     Ok(())
 }
 
 struct State {
-    shm_alloc: ShmAlloc,
-    seats: Seats,
-    keyboards: Vec<Keyboard>,
-    kbd_repeat: Option<(Timer, menu::Action)>,
-    outputs: Vec<Output>,
+    pool: SlotPool,
     keyboard_shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     keyboard_shortcuts_inhibitors: HashMap<WlSeat, ZwpKeyboardShortcutsInhibitorV1>,
 
-    wl_surface: WlSurface,
-    layer_surface: ZwlrLayerSurfaceV1,
-    visible_on_outputs: HashSet<ObjectId>,
+    shm: Shm,
+    output: OutputState,
+    registry_state: RegistryState,
+    layer_surface: LayerSurface,
+    seat: SeatState,
+    keyboard: Option<WlKeyboard>,
+
     surface_scale: u32,
     exit: bool,
     configured: bool,
     width: u32,
     height: u32,
-    throttle_cb: Option<WlCallback>,
-    throttled: bool,
+    damaged: bool,
 
     menu: menu::Menu,
     config: config::Config,
-}
 
-struct Output {
-    wl: WlOutput,
-    reg_name: u32,
-    scale: u32,
+    modifiers: ModifierState,
 }
 
 impl State {
-    fn draw(&mut self, conn: &mut Connection<Self>) {
+    fn draw(&mut self, _conn: &Connection, qh: &QueueHandle<State>) {
         if !self.configured {
             return;
         }
 
-        if self.throttle_cb.is_some() {
-            self.throttled = true;
+        if !self.damaged {
             return;
         }
 
-        self.throttle_cb = Some(self.wl_surface.frame_with_cb(conn, |ctx| {
-            assert_eq!(ctx.state.throttle_cb, Some(ctx.proxy));
-            ctx.state.throttle_cb = None;
-            if ctx.state.throttled {
-                ctx.state.throttled = false;
-                ctx.state.draw(ctx.conn);
-            }
-        }));
-
-        let scale = if self.wl_surface.version() >= 6 {
-            self.surface_scale
-        } else {
-            self.outputs
-                .iter()
-                .filter(|o| self.visible_on_outputs.contains(&o.wl.id()))
-                .map(|o| o.scale)
-                .max()
-                .unwrap_or(1)
-        };
+        let scale = self.surface_scale;
 
         let width_f = self.width as f64;
         let height_f = self.height as f64;
 
         let (buffer, canvas) = self
-            .shm_alloc
-            .alloc_buffer(
-                conn,
-                BufferSpec {
-                    width: self.width * scale,
-                    height: self.height * scale,
-                    stride: self.width * 4 * scale,
-                    format: wl_shm::Format::Argb8888,
-                },
+            .pool
+            .create_buffer(
+                (self.width * scale) as i32,
+                (self.height * scale) as i32,
+                (self.width * 4 * scale) as i32,
+                Format::Argb8888,
             )
             .expect("could not allocate frame shm buffer");
 
@@ -248,16 +207,16 @@ impl State {
             cairo::ImageSurface::create_for_data_unsafe(
                 canvas.as_mut_ptr(),
                 cairo::Format::ARgb32,
-                (self.width * scale) as i32,
-                (self.height * scale) as i32,
-                (self.width * 4 * scale) as i32,
+                (self.width/*  * scale */) as i32,
+                (self.height/*  * scale */) as i32,
+                (self.width * 4/*  * scale */) as i32,
             )
             .expect("cairo surface")
         };
 
         let cairo_ctx = cairo::Context::new(&cairo_surf).expect("cairo context");
         cairo_ctx.scale(scale as f64, scale as f64);
-        self.wl_surface.set_buffer_scale(conn, scale as i32);
+        self.layer_surface.wl_surface().set_buffer_scale(scale as i32);
 
         // background with rounded corners
         cairo_ctx.save().unwrap();
@@ -302,224 +261,336 @@ impl State {
         self.menu.render(&self.config, &cairo_ctx).unwrap();
 
         // Damage the entire window
-        self.wl_surface.damage_buffer(
-            conn,
+        self.layer_surface.wl_surface().damage_buffer(
             0,
             0,
             (self.width * scale) as i32,
             (self.height * scale) as i32,
         );
+        self.damaged = false;
+
+        self.layer_surface
+            .wl_surface()
+            .frame(qh, self.layer_surface.wl_surface().clone());
 
         // Attach and commit to present.
-        self.wl_surface
-            .attach(conn, Some(buffer.into_wl_buffer()), 0, 0);
-        self.wl_surface.commit(conn);
+        buffer.attach_to(self.layer_surface.wl_surface()).unwrap();
+        self.layer_surface.wl_surface().commit();
     }
 
-    fn handle_action(&mut self, conn: &mut Connection<Self>, action: menu::Action) {
+    fn handle_action(&mut self, _conn: &Connection, action: menu::Action) {
         match action {
             menu::Action::Quit => {
                 self.exit = true;
-                conn.break_dispatch_loop();
             }
             menu::Action::Exec { cmd, keep_open } => {
                 exec(&cmd);
                 if !keep_open {
                     self.exit = true;
-                    conn.break_dispatch_loop();
                 }
             }
             menu::Action::Submenu(page) => {
                 self.menu.set_page(page);
                 self.width = self.menu.width(&self.config) as u32;
                 self.height = self.menu.height(&self.config) as u32;
-                self.layer_surface.set_size(conn, self.width, self.height);
-                self.wl_surface.commit(conn);
+                self.layer_surface.set_size(self.width, self.height);
+                self.layer_surface.commit();
+                self.damaged = true;
             }
         }
+    }
+}
+
+impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpKeyboardShortcutsInhibitManagerV1,
+        _event: <ZwpKeyboardShortcutsInhibitManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpKeyboardShortcutsInhibitorV1,
+        _event: <ZwpKeyboardShortcutsInhibitorV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl CompositorHandler for State {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        let scale = new_factor as u32;
+        if scale != self.surface_scale {
+            self.surface_scale = scale;
+            self.damaged = true;
+        }
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _new_transform: wayland_client::protocol::wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        self.draw(conn, qh);
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _output: &wayland_client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _output: &wayland_client::protocol::wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl OutputHandler for State {
+    fn output_state(&mut self) -> &mut smithay_client_toolkit::output::OutputState {
+        &mut self.output
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wayland_client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wayland_client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wayland_client::protocol::wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl LayerShellHandler for State {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        self.exit = true
+    }
+
+    fn configure(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _layer: &LayerSurface,
+        configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
+        _serial: u32,
+    ) {
+        let size = configure.new_size;
+        self.width = size.0;
+        self.height = size.1;
+        self.configured = true;
+        self.draw(conn, qh);
+    }
+}
+
+impl ProvidesRegistryState for State {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+
+    fn runtime_add_global(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _name: u32,
+        _interface: &str,
+        _version: u32,
+    ) {
+    }
+
+    fn runtime_remove_global(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _name: u32,
+        _interface: &str,
+    ) {
+    }
+}
+
+impl ShmHandler for State {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
     }
 }
 
 impl SeatHandler for State {
-    fn get_seats(&mut self) -> &mut Seats {
-        &mut self.seats
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat
     }
 
-    fn seat_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
-        if let Some(inhibit_manager) = self.keyboard_shortcuts_inhibit_manager {
+    fn new_seat(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+        if let Some(inhibit_manager) = &self.keyboard_shortcuts_inhibit_manager {
             self.keyboard_shortcuts_inhibitors.insert(
-                seat,
-                inhibit_manager.inhibit_shortcuts(conn, self.wl_surface, seat),
+                seat.clone(),
+                inhibit_manager.inhibit_shortcuts(self.layer_surface.wl_surface(), &seat, qh, ()),
             );
         }
     }
 
-    fn seat_removed(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
+    fn remove_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
         if let Some(inhibitor) = self.keyboard_shortcuts_inhibitors.remove(&seat) {
-            inhibitor.destroy(conn);
+            inhibitor.destroy();
         }
     }
 
-    fn keyboard_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
-        self.keyboards.push(Keyboard::new(conn, seat));
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            let keyboard = self
+                .seat
+                .get_keyboard(qh, &seat, None)
+                .expect("Failed to create keyboard");
+            self.keyboard = Some(keyboard.clone());
+        }
     }
 
-    fn keyboard_removed(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
-        let i = self
-            .keyboards
-            .iter()
-            .position(|k| k.seat() == seat)
-            .unwrap();
-        let keyboard = self.keyboards.swap_remove(i);
-        keyboard.destroy(conn);
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_some() {
+            self.keyboard.take().unwrap().release();
+        }
     }
 }
 
 impl KeyboardHandler for State {
-    fn get_keyboard(&mut self, wl_keyboard: WlKeyboard) -> &mut Keyboard {
-        self.keyboards
-            .iter_mut()
-            .find(|k| k.wl_keyboard() == wl_keyboard)
-            .unwrap()
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
     }
 
-    fn key_presed(&mut self, conn: &mut Connection<Self>, event: KeyboardEvent) {
-        self.kbd_repeat = None;
-        let modifiers = ModifierState::from_xkb_state(&event.xkb_state);
-        let action = if let Some(action) = self.menu.get_action(modifiers, event.keysym) {
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        let action = if let Some(action) = self.menu.get_action(self.modifiers, event.keysym) {
             Some(action)
-        } else if self.config.auto_kbd_layout {
-            let mask = XkbMaskState::new(&event.xkb_state);
-            let mut action = None;
-            // Try each layout
-            for layout in 0..event.xkb_state.get_keymap().num_layouts() {
-                mask.with_locked_layout(layout).apply(&event.xkb_state);
-                if let Some(a) = self
-                    .menu
-                    .get_action(modifiers, event.xkb_state.key_get_one_sym(event.keycode))
-                {
-                    action = Some(a);
-                    break;
-                }
-            }
-            mask.apply(&event.xkb_state); // Restore the state
-            action
         } else {
             None
         };
         if let Some(action) = action {
-            if let Some(repeat) = event.repeat_info {
-                self.kbd_repeat = Some((Timer::new(repeat.delay, repeat.interval), action.clone()));
-            }
             self.handle_action(conn, action);
         }
     }
 
-    fn key_released(&mut self, _: &mut Connection<Self>, _: KeyboardEvent) {
-        self.kbd_repeat = None;
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        _layout: u32,
+    ) {
+        self.modifiers = ModifierState::from_sctk_modifiers(&modifiers);
     }
 }
 
-fn wl_registry_cb(conn: &mut Connection<State>, state: &mut State, event: &wl_registry::Event) {
-    match event {
-        wl_registry::Event::Global(g) if g.is::<WlOutput>() => {
-            state.outputs.push(Output {
-                wl: g.bind_with_cb(conn, 1..=4, wl_output_cb).unwrap(),
-                reg_name: g.name,
-                scale: 1,
-            });
-        }
-        wl_registry::Event::GlobalRemove(name) => {
-            if let Some(output_i) = state.outputs.iter().position(|o| o.reg_name == *name) {
-                let output = state.outputs.swap_remove(output_i);
-                state.visible_on_outputs.remove(&output.wl.id());
-                if output.wl.version() >= 3 {
-                    output.wl.release(conn);
-                }
-            }
-        }
-        _ => (),
-    }
-}
+delegate_compositor!(State);
+delegate_output!(State);
+delegate_shm!(State);
+delegate_seat!(State);
+delegate_keyboard!(State);
 
-fn wl_output_cb(ctx: EventCtx<State, WlOutput>) {
-    if let wl_output::Event::Scale(scale) = ctx.event {
-        let output = ctx
-            .state
-            .outputs
-            .iter_mut()
-            .find(|o| o.wl == ctx.proxy)
-            .unwrap();
-        let scale: u32 = scale.try_into().unwrap();
-        if output.scale != scale {
-            output.scale = scale;
-            ctx.state.draw(ctx.conn);
-        }
-    }
-}
-
-fn wl_surface_cb(ctx: EventCtx<State, WlSurface>) {
-    assert_eq!(ctx.proxy, ctx.state.wl_surface);
-    match ctx.event {
-        wl_surface::Event::Enter(output) => {
-            ctx.state.visible_on_outputs.insert(output);
-            ctx.state.draw(ctx.conn);
-        }
-        wl_surface::Event::Leave(output) => {
-            ctx.state.visible_on_outputs.remove(&output);
-        }
-        wl_surface::Event::PreferredBufferScale(scale) => {
-            assert!(scale >= 1);
-            let scale = scale as u32;
-            if ctx.state.surface_scale != scale {
-                ctx.state.surface_scale = scale;
-                ctx.state.draw(ctx.conn);
-            }
-        }
-        _ => (),
-    }
-}
-
-fn layer_surface_cb(ctx: EventCtx<State, ZwlrLayerSurfaceV1>) {
-    assert_eq!(ctx.proxy, ctx.state.layer_surface);
-    match ctx.event {
-        zwlr_layer_surface_v1::Event::Configure(args) => {
-            if args.width != 0 {
-                ctx.state.width = args.width;
-            }
-            if args.height != 0 {
-                ctx.state.height = args.height;
-            }
-            ctx.state.configured = true;
-            ctx.proxy.ack_configure(ctx.conn, args.serial);
-            ctx.state.draw(ctx.conn);
-        }
-        zwlr_layer_surface_v1::Event::Closed => {
-            ctx.state.exit = true;
-            ctx.conn.break_dispatch_loop();
-        }
-        _ => (),
-    }
-}
-
-fn poll(fd: RawFd, timeout: Option<Duration>) -> io::Result<()> {
-    let mut fds = [libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    let res = unsafe {
-        libc::poll(
-            fds.as_mut_ptr(),
-            1,
-            timeout.map_or(-1, |t| t.as_millis() as _),
-        )
-    };
-    match res {
-        -1 => Err(io::Error::last_os_error()),
-        _ => Ok(()),
-    }
-}
+delegate_layer!(State);
+delegate_registry!(State);
 
 fn exec(cmd: &str) {
     let mut proc = Command::new("sh");
@@ -534,48 +605,4 @@ fn exec(cmd: &str) {
         });
     }
     proc.spawn().unwrap().wait().unwrap();
-}
-
-#[derive(Clone, Copy)]
-struct XkbMaskState {
-    depressed_mods: u32,
-    latched_mods: u32,
-    locked_mods: u32,
-    depressed_layout: u32,
-    latched_layout: u32,
-    locked_layout: u32,
-}
-
-impl XkbMaskState {
-    fn new(xkb_state: &xkb::State) -> Self {
-        Self {
-            depressed_mods: xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            latched_mods: xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED),
-            locked_mods: xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED),
-            depressed_layout: xkb_state.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
-            latched_layout: xkb_state.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
-            locked_layout: xkb_state.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
-        }
-    }
-
-    fn with_locked_layout(&self, locked_layout: u32) -> Self {
-        Self {
-            locked_layout,
-            ..*self
-        }
-    }
-
-    fn apply(&self, xkb_state: &xkb::State) {
-        // Hack: this is just ref counting, no actual cloning. `update_mask` should probably just
-        // accept `&self` instead of `&mut self`.
-        let mut xkb_state = xkb_state.clone();
-        xkb_state.update_mask(
-            self.depressed_mods,
-            self.latched_mods,
-            self.locked_mods,
-            self.depressed_layout,
-            self.latched_layout,
-            self.locked_layout,
-        );
-    }
 }
